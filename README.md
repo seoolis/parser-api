@@ -1,5 +1,9 @@
 .\nats-server.exe
 
+.\nats-server.exe -p 4222 -m 8222
+http://localhost:8222
+
+
 uvicorn main:app
 
 .\nats.exe sub "currency.updates"

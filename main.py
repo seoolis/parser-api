@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from starlette.websockets import WebSocketDisconnect
 from nats.aio.client import Client as NATS
+import socket
+import traceback
 
 # --- НАСТРОЙКИ БАЗЫ ДАННЫХ ---
 # Используем асинхронный драйвер aiosqlite
@@ -28,6 +30,20 @@ class CurrencyRate(SQLModel, table=True):
     rate: float  # Текущий курс
     updated_at: str  # Время последнего обновления
 
+
+from pydantic import BaseModel
+from typing import Optional
+
+class CurrencyRateResponse(BaseModel):
+    id: int
+    code: str
+    name: str
+    rate: float
+    updated_at: str
+
+    model_config = {
+        "from_attributes": True  # позволяет сериализовать ORM-объекты (SQLModel)
+    }
 
 # Зависимость для получения сессии БД в эндпоинтах
 async def get_db():
@@ -63,10 +79,6 @@ nats_client = NATS()
 # --- ЛОГИКА ПАРСЕРА (HTTPX + NATS) ---
 
 async def update_all_currencies_logic(db: AsyncSession):
-    """
-    Основная логика: парсит данные с ЦБ РФ, обновляет БД
-    и отправляет уведомления в NATS.
-    """
     url = "https://www.cbr-xml-daily.ru/daily_json.js"
     async with httpx.AsyncClient() as client:
         try:
@@ -79,20 +91,26 @@ async def update_all_currencies_logic(db: AsyncSession):
             valutes = data['Valute']
             timestamp = datetime.now().strftime("%H:%M:%S")
 
+            updated_count = 0
+            changes_detected = []
+
             for code, info in valutes.items():
-                # Ищем валюту в базе по коду
                 statement = select(CurrencyRate).where(CurrencyRate.code == code)
                 result = await db.execute(statement)
                 db_item = result.scalar_one_or_none()
 
                 new_rate = info['Value']
 
+                # ПРОВЕРКА: Изменился ли курс?
                 if db_item:
-                    # Обновляем существующую
+                    if db_item.rate == new_rate:
+                        continue  # Пропускаем, если курс такой же
+
+                    old_rate = db_item.rate
                     db_item.rate = new_rate
                     db_item.updated_at = timestamp
+                    changes_detected.append(f"{code}: {old_rate} -> {new_rate}")
                 else:
-                    # Создаем новую запись
                     db_item = CurrencyRate(
                         code=code,
                         name=info['Name'],
@@ -100,16 +118,28 @@ async def update_all_currencies_logic(db: AsyncSession):
                         updated_at=timestamp
                     )
                     db.add(db_item)
+                    changes_detected.append(f"{code}: NEW -> {new_rate}")
 
-                # Публикуем событие в NATS для каждой валюты
+                updated_count += 1
+
+                # Публикуем в NATS только если изменилось
                 payload = {"id": db_item.id, "code": code, "rate": new_rate, "time": timestamp}
                 await nats_client.publish("currency.updates", json.dumps(payload).encode())
 
-            await db.commit()
-            print(f"[{timestamp}] База данных обновлена: {len(valutes)} валют.")
+            if updated_count > 0:
+                await db.commit()
+                print(f"[{timestamp}] Обновлено валют: {updated_count}")
+                for change in changes_detected:
+                    print(f"  - {change}")
+            else:
+                print(f"[{timestamp}] Новых курсов не найдено.")
 
-        except Exception as e:
-            print(f"Ошибка в работе парсера: {e}")
+
+        except Exception:
+
+            print("Ошибка в работе парсера:")
+
+            traceback.print_exc()
 
 
 async def periodic_fetch_task():
@@ -159,16 +189,14 @@ async def on_startup():
 
 # --- REST API ЭНДПОИНТЫ ---
 
-@app.get("/items", response_model=list[CurrencyRate])
+@app.get("/items", response_model=list[CurrencyRateResponse])
 async def get_all_items(db: AsyncSession = Depends(get_db)):
-    """Получить список всех валют из БД"""
     result = await db.execute(select(CurrencyRate))
     return result.scalars().all()
 
 
-@app.get("/items/{item_id}", response_model=CurrencyRate)
+@app.get("/items/{item_id}", response_model=CurrencyRateResponse)
 async def get_item_by_id(item_id: int, db: AsyncSession = Depends(get_db)):
-    """Получить данные конкретной валюты по ID"""
     item = await db.get(CurrencyRate, item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Валюта не найдена")
