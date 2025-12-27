@@ -1,14 +1,16 @@
 # database.py
 
+# Настройка подключения к базе данных и управление сессиями
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from fastapi import Depends
 
-# URL SQLite-базы (асинхронная версия)
+# Путь к файлу базы данных SQLite (асинхронная версия с использованием aiosqlite)
 DB_URL = "sqlite+aiosqlite:///./currency_database.db"
 
-# Асинхронный движок SQLAlchemy
-engine = create_async_engine(DB_URL, echo=False)
+# Асинхронный движок SQLAlchemy, он управляет подключением к БД
+engine = create_async_engine(DB_URL, echo=False) # echo=False означает, что не будет вывода SQL-запросов в консоль
 
 # Фабрика асинхронных сессий
 AsyncSessionLocal = sessionmaker(
@@ -19,9 +21,8 @@ AsyncSessionLocal = sessionmaker(
 
 # Зависимость FastAPI: внедряет сессию БД в эндпоинты
 async def get_db():
-    """
-    Генератор асинхронной сессии БД.
-    Используется как зависимость в маршрутах: `db: AsyncSession = Depends(get_db)`.
-    """
+    # Новая сессия на время запроса
     async with AsyncSessionLocal() as session:
+        # Передача сессии
         yield session
+    # Сессия автоматически закрывается после завершения запроса
