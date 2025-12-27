@@ -194,6 +194,10 @@ class CurrencyRateResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+class CurrencyRateCreate(BaseModel):
+    code: str
+    name: str
+    rate: float
 
 # --- ЭНДПОИНТЫ ---
 @app.get("/items", response_model=list[CurrencyRateResponse])
@@ -208,6 +212,40 @@ async def get_item_by_id(item_id: int, db: AsyncSession = Depends(get_db)):
     if not item:
         raise HTTPException(status_code=404, detail="Валюта не найдена")
     return item
+
+@app.post("/items", response_model=CurrencyRateResponse, status_code=201)
+async def create_currency(
+    currency: CurrencyRateCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    # Проверка на уникальность code
+    existing = await db.execute(select(CurrencyRate).where(CurrencyRate.code == currency.code))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Валюта с таким кодом уже существует")
+
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    new_currency = CurrencyRate(
+        code=currency.code,
+        name=currency.name,
+        rate=currency.rate,
+        updated_at=timestamp
+    )
+    db.add(new_currency)
+    await db.commit()
+    await db.refresh(new_currency)
+
+    # Публикация события создания
+    payload = {
+        "type": "created",
+        "id": new_currency.id,
+        "code": new_currency.code,
+        "name": new_currency.name,
+        "rate": new_currency.rate,
+        "updated_at": new_currency.updated_at
+    }
+    await nats_client.publish("currency.updates", json.dumps(payload, ensure_ascii=False).encode())
+
+    return new_currency
 
 
 @app.post("/tasks/run")
