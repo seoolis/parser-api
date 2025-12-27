@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import traceback
 from datetime import datetime
 import httpx
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends, WebSocket, Body
@@ -10,48 +11,29 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from starlette.websockets import WebSocketDisconnect
 from nats.aio.client import Client as NATS
-import socket
-import traceback
 
 # --- НАСТРОЙКИ БАЗЫ ДАННЫХ ---
-# Используем асинхронный драйвер aiosqlite
 DB_URL = "sqlite+aiosqlite:///./currency_database.db"
 engine = create_async_engine(DB_URL)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-# --- МОДЕЛЬ ДАННЫХ (SQLModel) ---
+# --- МОДЕЛЬ ДАННЫХ ---
 class CurrencyRate(SQLModel, table=True):
     __tablename__ = 'currency_rates'
-
-    id: int | None = Field(default=None, primary_key=True)  # ID для управления
-    code: str = Field(index=True, unique=True)  # Код (USD, EUR)
-    name: str  # Название (Доллар США)
-    rate: float  # Текущий курс
-    updated_at: str  # Время последнего обновления
-
-
-from pydantic import BaseModel
-from typing import Optional
-
-class CurrencyRateResponse(BaseModel):
-    id: int
-    code: str
+    id: int | None = Field(default=None, primary_key=True)
+    code: str = Field(index=True, unique=True)
     name: str
     rate: float
     updated_at: str
 
-    model_config = {
-        "from_attributes": True  # позволяет сериализовать ORM-объекты (SQLModel)
-    }
 
-# Зависимость для получения сессии БД в эндпоинтах
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
 
 
-# --- МЕНЕДЖЕР WEBSOCKET СОЕДИНЕНИЙ ---
+# --- WEBSOCKET МЕНЕДЖЕР ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -64,11 +46,10 @@ class ConnectionManager:
         self.active_connections.remove(websocket)
 
     async def broadcast(self, message: str):
-        """Отправка сообщения всем подключенным клиентам"""
         for connection in self.active_connections:
             try:
                 await connection.send_text(message)
-            except:
+            except Exception:
                 continue
 
 
@@ -76,10 +57,9 @@ manager = ConnectionManager()
 nats_client = NATS()
 
 
-# --- ЛОГИКА ПАРСЕРА (HTTPX + NATS) ---
-
+# --- ЛОГИКА ПАРСЕРА ---
 async def update_all_currencies_logic(db: AsyncSession):
-    url = "https://www.cbr-xml-daily.ru/daily_json.js"
+    url = "https://www.cbr-xml-daily.ru/daily_json.js"  # Убраны пробелы!
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url)
@@ -93,6 +73,7 @@ async def update_all_currencies_logic(db: AsyncSession):
 
             updated_count = 0
             changes_detected = []
+            new_items_for_publish = []  # Для публикации после коммита (чтобы был id)
 
             for code, info in valutes.items():
                 statement = select(CurrencyRate).where(CurrencyRate.code == code)
@@ -101,16 +82,28 @@ async def update_all_currencies_logic(db: AsyncSession):
 
                 new_rate = info['Value']
 
-                # ПРОВЕРКА: Изменился ли курс?
                 if db_item:
                     if db_item.rate == new_rate:
-                        continue  # Пропускаем, если курс такой же
+                        continue
 
                     old_rate = db_item.rate
                     db_item.rate = new_rate
                     db_item.updated_at = timestamp
                     changes_detected.append(f"{code}: {old_rate} -> {new_rate}")
+
+                    # Публикуем ОБНОВЛЕНИЕ (id уже есть)
+                    payload = {
+                        "type": "auto_update",
+                        "id": db_item.id,
+                        "code": code,
+                        "name": info["Name"],
+                        "rate": new_rate,
+                        "updated_at": timestamp
+                    }
+                    await nats_client.publish("currency.updates", json.dumps(payload, ensure_ascii=False).encode())
+
                 else:
+                    # Новая запись — id появится только после коммита
                     db_item = CurrencyRate(
                         code=code,
                         name=info['Name'],
@@ -119,43 +112,49 @@ async def update_all_currencies_logic(db: AsyncSession):
                     )
                     db.add(db_item)
                     changes_detected.append(f"{code}: NEW -> {new_rate}")
+                    # Запоминаем для публикации после коммита
+                    new_items_for_publish.append((db_item, code, info["Name"], new_rate, timestamp))
 
                 updated_count += 1
 
-                # Публикуем в NATS только если изменилось
-                payload = {"id": db_item.id, "code": code, "rate": new_rate, "time": timestamp}
-                await nats_client.publish("currency.updates", json.dumps(payload).encode())
-
             if updated_count > 0:
                 await db.commit()
+
+                # Публикуем события для НОВЫХ записей (теперь id известен)
+                for (item, code, name, rate, ts) in new_items_for_publish:
+                    await db.refresh(item)  # Получаем id из БД
+                    payload = {
+                        "type": "created",
+                        "id": item.id,
+                        "code": code,
+                        "name": name,
+                        "rate": rate,
+                        "updated_at": ts
+                    }
+                    await nats_client.publish("currency.updates", json.dumps(payload, ensure_ascii=False).encode())
+
                 print(f"[{timestamp}] Обновлено валют: {updated_count}")
                 for change in changes_detected:
                     print(f"  - {change}")
             else:
                 print(f"[{timestamp}] Новых курсов не найдено.")
 
-
         except Exception:
-
             print("Ошибка в работе парсера:")
-
             traceback.print_exc()
 
 
 async def periodic_fetch_task():
-    """Фоновая задача: запускается раз в 120 секунд"""
     while True:
         async with AsyncSessionLocal() as db:
             await update_all_currencies_logic(db)
-        await asyncio.sleep(120)  # ИНТЕРВАЛ ОБНОВЛЕНИЯ
+        await asyncio.sleep(120)
 
 
 # --- FASTAPI ПРИЛОЖЕНИЕ ---
-
 app = FastAPI(title="Currency Real-time Parser", version="2.0")
 
 
-# Middleware для замера времени обработки запроса
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
@@ -167,15 +166,12 @@ async def add_process_time_header(request: Request, call_next):
 
 @app.on_event("startup")
 async def on_startup():
-    # 1. Создаем таблицы в БД
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-    # 2. Подключаемся к NATS
     try:
         await nats_client.connect("nats://127.0.0.1:4222")
 
-        # Подписываемся на канал NATS и транслируем в WebSocket
         async def nats_handler(msg):
             await manager.broadcast(msg.data.decode())
 
@@ -183,12 +179,23 @@ async def on_startup():
     except Exception as e:
         print(f"Ошибка NATS: {e}. Проверьте, запущен ли nats-server.exe")
 
-    # 3. Запускаем автоматический сбор данных в фоновом потоке asyncio
     asyncio.create_task(periodic_fetch_task())
 
 
-# --- REST API ЭНДПОИНТЫ ---
+# --- Pydantic RESPONSE MODEL (фиксированный порядок) ---
+from pydantic import BaseModel
 
+class CurrencyRateResponse(BaseModel):
+    id: int
+    code: str
+    name: str
+    rate: float
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+# --- ЭНДПОИНТЫ ---
 @app.get("/items", response_model=list[CurrencyRateResponse])
 async def get_all_items(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(CurrencyRate))
@@ -205,8 +212,6 @@ async def get_item_by_id(item_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.post("/tasks/run")
 async def run_manual_parser(background_tasks: BackgroundTasks):
-    """Принудительный запуск сбора данных"""
-
     async def manual_job():
         async with AsyncSessionLocal() as db:
             await update_all_currencies_logic(db)
@@ -216,45 +221,59 @@ async def run_manual_parser(background_tasks: BackgroundTasks):
 
 
 @app.patch("/items/{item_id}")
-async def update_item_manual(item_id: int, new_rate: float = Body(..., embed=True), db: AsyncSession = Depends(get_db)):
-    """Изменить курс валюты вручную по ID"""
+async def update_item_manual(
+    item_id: int,
+    new_rate: float = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db)
+):
     item = await db.get(CurrencyRate, item_id)
     if not item:
         raise HTTPException(status_code=404, detail="Запись не найдена")
 
     item.rate = new_rate
     item.updated_at = datetime.now().strftime("%H:%M:%S")
-
     await db.commit()
     await db.refresh(item)
 
-    # Сообщаем об изменении через NATS
-    await nats_client.publish("currency.updates",
-                              json.dumps({"id": item_id, "event": "manual_patch", "new_rate": new_rate}).encode())
+    payload = {
+        "type": "manual_patch",
+        "id": item.id,
+        "code": item.code,
+        "name": item.name,
+        "rate": new_rate,
+        "updated_at": item.updated_at
+    }
+    await nats_client.publish("currency.updates", json.dumps(payload, ensure_ascii=False).encode())
     return item
 
 
 @app.delete("/items/{item_id}")
 async def delete_item(item_id: int, db: AsyncSession = Depends(get_db)):
-    """Удалить валюту из базы по ID"""
     item = await db.get(CurrencyRate, item_id)
     if not item:
         raise HTTPException(status_code=404, detail="ID не существует")
 
+    code = item.code
+    name = item.name
     await db.delete(item)
     await db.commit()
+
+    payload = {
+        "type": "deleted",
+        "id": item_id,
+        "code": code,
+        "name": name,
+        "deleted_at": datetime.now().strftime("%H:%M:%S")
+    }
+    await nats_client.publish("currency.updates", json.dumps(payload, ensure_ascii=False).encode())
     return {"status": "Deleted", "id": item_id}
 
 
-# --- WEBSOCKET ЭНДПОИНТ ---
-
 @app.websocket("/ws/items")
 async def websocket_currency(websocket: WebSocket):
-    """Канал для получения живых обновлений курсов"""
     await manager.connect(websocket)
     try:
         while True:
-            # Ожидаем данных (пингов) от клиента, чтобы не закрылось соединение
-            await websocket.receive_text()
+            await websocket.receive_text()  # keep-alive
     except WebSocketDisconnect:
         manager.disconnect(websocket)
