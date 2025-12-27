@@ -63,4 +63,4 @@ venv.bak/
 
 #DB
 
-tasks.db
+currency_database.db
